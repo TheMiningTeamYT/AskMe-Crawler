@@ -1,0 +1,559 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Net;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Data;
+using System.Data.SqlClient;
+using System.Data.SqlTypes;
+using HtmlAgilityPack;
+using Robots;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+
+namespace AskMe_Crawler {
+    class Program {
+        private static AskMeConfig config;
+        private static Regex URLFilter;
+        private static Regex cleaner = new Regex(@"&(?!(#\d+|[a-z]+);)|;(?<!&(#\d+|[a-z]+);)|#(?<!&)(?!\d+;)|&nbsp;|&#32;|&#160;|&ensp;|&#8194;|&emsp;|&#8195;|[^a-z0-9'&#; ]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static Regex URLcleaner = new Regex(@"#.+(?<!/.+#)$", RegexOptions.Compiled);
+        private static Regex mimeTypeFilter = new Regex(@"([a-z]+/)?[a-z0-9\-]+(?=;?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private const string userAgent = "AskMeCrawler/1.0";
+        public const int CRAWLSUCCESS = 0;
+        public const int CRAWLLATER = 1;
+        public const int CRAWLFILTERED = 2;
+        public const int CRAWLTOOLONG = 3;
+        public const int CRAWLNOTALLOWED = 4;
+        public const int CRAWLNOTHTTP = 5;
+        public const int CRAWLFAIL = -1;
+        static void Main(string[] args) {
+            // Open config file.
+            using (FileStream configFile = File.OpenRead("askme.json")) {
+                using (StreamReader configRaw = new StreamReader(configFile)) {
+                    config = JsonConvert.DeserializeObject<AskMeConfig>(configRaw.ReadToEnd());
+                }
+            }
+            try {
+                URLFilter = new Regex(config.filter, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+            } catch (ArgumentException e) {
+                Console.WriteLine("Unable to parse filter! Error: " + e.Message);
+                URLFilter = new Regex(".*");
+            }
+            try {
+                SqlConnection dbConn = new SqlConnection($"Server={config.sqlServer}; Database={config.sqlDB}; User Id={config.sqlUsername}; Password={config.sqlPassword}");
+                dbConn.Open();
+                // Create tables if they don't exist
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'PageIndex') BEGIN CREATE TABLE PageIndex (ID BIGINT PRIMARY KEY, word VARCHAR(64), neighbors TEXT, pageID BIGINT); CREATE INDEX idx_word ON PageIndex (word); CREATE INDEX idx_pageID ON PageIndex (pageID); END", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Pages') BEGIN CREATE TABLE Pages (ID BIGINT PRIMARY KEY, url VARCHAR(512), lastIndexed DATETIME, nextIndex DATETIME, contents TEXT, crawlDepth INT, clicks INT); CREATE UNIQUE INDEX idx_url ON Pages (url); CREATE INDEX idx_nextIndex ON Pages (nextIndex); END", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Robots') BEGIN CREATE TABLE Robots (domain VARCHAR(256) PRIMARY KEY, robots TEXT, lastIndexed DATETIME, nextCrawl DATETIME); END", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Queue') BEGIN CREATE TABLE Queue (ID BIGINT PRIMARY KEY, url VARCHAR(512), attempts INT, nextIndex DATETIME, crawlDepth INT); CREATE UNIQUE INDEX idx_url ON Queue (url); CREATE INDEX idx_nextIndex ON Queue (nextIndex); END", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Quarantine') BEGIN CREATE TABLE Quarantine (ID INT IDENTITY(1,1) PRIMARY KEY, url VARCHAR(512)); CREATE UNIQUE INDEX idx_url ON Quarantine (url); END", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                Task crawlThread = Task.Factory.StartNew(CrawlThread);
+                Random rand = new Random();
+                byte[] IDraw = new byte[8];
+                while (true) {
+                    Console.WriteLine("AskMe Crawler Ready.");
+                    string command = Console.ReadLine().ToLower();
+                    string[] cmdArgs = command.Split(' ');
+                    switch (cmdArgs[0]) {
+                        case "view":
+                            if (cmdArgs.Length > 1) {
+                                if (cmdArgs[1] == "quarantine") {
+                                    Console.WriteLine("Quarantine:");
+                                    DataSet quarantine = new DataSet();
+                                    SqlDataAdapter adapter = new SqlDataAdapter {
+                                        SelectCommand = new SqlCommand($"SELECT * FROM Quarantine;", dbConn)
+                                    };
+                                    adapter.Fill(quarantine);
+                                    foreach (DataRow row in quarantine.Tables[0].Rows) {
+                                        Console.WriteLine($"ID: {(int)row["ID"]} URL: {(string)row["url"]}");
+                                    }
+                                    Console.WriteLine($"{quarantine.Tables[0].Rows.Count} items in quarantine.");
+                                    break;
+                                } else if (cmdArgs[1] == "queue") {
+                                    Console.WriteLine("Queue:");
+                                    DataSet queue = new DataSet();
+                                    SqlDataAdapter adapter = new SqlDataAdapter {
+                                        SelectCommand = new SqlCommand($"SELECT * FROM Queue;", dbConn)
+                                    };
+                                    adapter.Fill(queue);
+                                    foreach (DataRow row in queue.Tables[0].Rows) {
+                                        Console.WriteLine($"ID: {(Int64)row["ID"]} URL: \"{(string)row["url"]}\" Attempts: {(int)row["attempts"]} Next Index: {new SqlDateTime((DateTime)row["nextIndex"])} Crawl Depth: {(int)row["crawlDepth"]}");
+                                    }
+                                    Console.WriteLine($"{queue.Tables[0].Rows.Count} items in the queue.");
+                                    break;
+                                }
+                            }
+                            Console.WriteLine("? Syntax: view <quarentine or queue>");
+                            break;
+                        case "index":
+                            if (cmdArgs.Length > 2) {
+                                try {
+                                    string url = cmdArgs[1].Replace("'", "''");
+                                    int crawlDepth = int.Parse(cmdArgs[2]);
+                                    rand.NextBytes(IDraw);
+                                    Int64 ID = BitConverter.ToInt64(IDraw, 0);
+                                    using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{url}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({ID}, '{url}', 0, '{new SqlDateTime(DateTime.UtcNow)}', {crawlDepth});", dbConn)) {
+                                        cmd.ExecuteNonQuery();
+                                        Console.WriteLine($"Successfully inserted {cmdArgs[1]} into the queue with a crawl depth of {crawlDepth}.");
+                                    }
+                                } catch (Exception e) {
+                                    Console.WriteLine($"An error occurred while procesing the command: {e.Message}");
+                                }
+                                break;
+                            }
+                            Console.WriteLine("? Syntax: index <url:string> <crawl depth:int>");
+                            break;
+                        case "allow":
+                            if (cmdArgs.Length > 1) {
+                                try {
+                                    int ID = int.Parse(cmdArgs[1]);
+                                    bool foundEntry = false;
+                                    string url = "";
+                                    using (SqlCommand cmd = new SqlCommand($"SELECT url FROM Quarantine WHERE ID = {ID};", dbConn)) {
+                                        using (SqlDataReader result = cmd.ExecuteReader()) {
+                                            if (result.HasRows) {
+                                                result.Read();
+                                                url = result.GetString(result.GetOrdinal("url"));
+                                                foundEntry = true;
+                                            }
+                                        }
+                                    }
+                                    if (foundEntry) {
+                                        rand.NextBytes(IDraw);
+                                        Int64 newID = BitConverter.ToInt64(IDraw, 0);
+                                        using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{url.Replace("'", "''")}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({newID}, '{url.Replace("'", "''")}', 0, '{new SqlDateTime(DateTime.UtcNow)}', {config.crawlDepth});", dbConn)) {
+                                            cmd.ExecuteNonQuery();
+                                        }
+                                        using (SqlCommand cmd = new SqlCommand($"DELETE FROM Quarantine WHERE ID = {ID}", dbConn)) {
+                                            cmd.ExecuteNonQuery();
+                                        }
+                                        Console.WriteLine($"Successfully moved quarantine ID {ID} (URL: {url}) into the queue.");
+                                        break;
+                                    }
+                                } catch (Exception e) {
+                                    Console.WriteLine($"An error occurred while procesing the command: {e.Message}");
+                                }
+                                break;
+                            }
+                            Console.WriteLine("? Syntax: allow <quarantine ID: int>");
+                            break;
+                        case "reject":
+                            if (cmdArgs.Length > 1) {
+                                try {
+                                    int ID = int.Parse(cmdArgs[1]);
+                                    using (SqlCommand cmd = new SqlCommand($"DELETE FROM Quarantine WHERE ID = {ID}", dbConn)) {
+                                        cmd.ExecuteNonQuery();
+                                    }
+                                    Console.WriteLine($"Successfully deleted quarantine ID {ID}.");
+                                    break;
+                                } catch (Exception e) {
+                                    Console.WriteLine($"An error occurred while procesing the command: {e.Message}");
+                                }
+                                break;
+                            }
+                            Console.WriteLine("? Syntax: reject <quarantine ID: int>");
+                            break;
+                        case "stop":
+                            System.Environment.Exit(0);
+                            break;
+                        case "help":
+                            Console.Write(
+                                $"view <quarantine or queue>{System.Environment.NewLine}" +
+                                $"View the items that are currently in the quarantine or in the queue.{System.Environment.NewLine}{System.Environment.NewLine}" +
+                                $"index <url:string> <queue depth:int>{System.Environment.NewLine}" +
+                                $"Manually add a page to the index queue with a specified queue depth.{System.Environment.NewLine}{System.Environment.NewLine}" +
+                                $"allow <quarantine ID:int>{System.Environment.NewLine}" +
+                                $"Allow the item in the quarantine with the specified ID to be indexed.{System.Environment.NewLine}{System.Environment.NewLine}" +
+                                $"reject <quarantine ID:int>{System.Environment.NewLine}" +
+                                $"Remove the item in the quarantine with the specified ID from the queue.{System.Environment.NewLine}{System.Environment.NewLine}" +
+                                $"stop{System.Environment.NewLine}" +
+                                $"Stop the crawler.{System.Environment.NewLine}{System.Environment.NewLine}" +
+                                $"help{System.Environment.NewLine}" +
+                                $"Print this help."
+                            );
+                            break;
+                        default:
+                            Console.WriteLine($"? Unknown command {cmdArgs[0]}");
+                            break;
+                    }
+                }
+            } catch (Exception e) {
+                Console.WriteLine("Failed to connect to database! Error: " + e.Message);
+                Console.ReadKey(false);
+                System.Environment.Exit(-1);
+            }
+        }
+        static void CrawlThread() {
+            SqlConnection dbConn = new SqlConnection($"Server={config.sqlServer}; Database={config.sqlDB}; User Id={config.sqlUsername}; Password={config.sqlPassword}");
+            dbConn.Open();
+            Random rand = new Random();
+            while (true) {
+                DataSet queue;
+                SqlDataAdapter adapter;
+                while (true) {
+                    queue = new DataSet();
+                    adapter = new SqlDataAdapter {
+                        SelectCommand = new SqlCommand($"SELECT * FROM Queue WHERE nextIndex < '{new SqlDateTime(DateTime.UtcNow)}';", dbConn)
+                    };
+                    adapter.Fill(queue);
+                    if (queue.Tables[0].Rows.Count == 0) {
+                        break;
+                    }
+                    Task<int>[] threads = new Task<int>[config.threads];
+                    int j = 0;
+                    foreach (DataRow row in queue.Tables[0].Rows) {
+                        if (j < config.threads) {
+                            threads[j++] = Task<int>.Factory.StartNew(Crawler, new CrawlState((string)row["url"], (int)row["crawlDepth"], rand.Next(), (Int64)row["ID"], (int)row["attempts"]));
+                        } else {
+                            int index = Task.WaitAny(threads);
+                            Task<int> thread = threads[index];
+                            if (thread.Result >= 0 || ((CrawlState)thread.AsyncState).attempts > 2) {
+                                using (SqlCommand cmd = new SqlCommand($"DELETE FROM Queue WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
+                                    cmd.ExecuteNonQuery();
+                                }
+                            } else {
+                                using (SqlCommand cmd = new SqlCommand($"UPDATE Queue SET attempts = {((CrawlState)thread.AsyncState).attempts + 1}, nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + rand.Next(0, 172800)))}' WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
+                                    cmd.ExecuteNonQuery();
+                                }
+                            }
+                            if (thread.Result == 0) {
+                                Console.WriteLine("Page " + ((CrawlState)thread.AsyncState).URL + " indexed!");
+                            }
+                            threads[index] = Task<int>.Factory.StartNew(Crawler, new CrawlState((string)row["url"], (int)row["crawlDepth"], rand.Next(), (Int64)row["ID"], (int)row["attempts"]));
+                        }
+                    }
+                    foreach (Task<int> thread in threads) {
+                        if (thread != null) {
+                            if (thread.Result >= 0 || ((CrawlState)thread.AsyncState).attempts > 2) {
+                                using (SqlCommand cmd = new SqlCommand($"DELETE FROM Queue WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
+                                    cmd.ExecuteNonQuery();
+                                }
+                            } else {
+                                using (SqlCommand cmd = new SqlCommand($"UPDATE Queue SET attempts = {((CrawlState)thread.AsyncState).attempts + 1}, nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + rand.Next(0, 172800)))}' WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
+                                    cmd.ExecuteNonQuery();
+                                }
+                            }
+                        }
+                    }
+                    
+                }
+                // Queue pages that haven't been indexed in a while.
+                queue = new DataSet();
+                adapter = new SqlDataAdapter {
+                    SelectCommand = new SqlCommand($"SELECT * FROM Pages WHERE nextIndex < '{new SqlDateTime(DateTime.UtcNow)}';", dbConn)
+                };
+                adapter.Fill(queue);
+                byte[] IDraw = new byte[8];
+                foreach (DataRow row in queue.Tables[0].Rows) {
+                    rand.NextBytes(IDraw);
+                    using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{((string)row["url"]).Replace("'", "''")}') INSERT INTO Queue (ID, url, attempts, nextIndex) VALUES ({BitConverter.ToInt64(IDraw, 0)}, '{((string)row["url"]).Replace("'", "''")}', 0, '{(SqlDateTime)row["nextIndex"]}')")) {
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                Console.WriteLine("Crawl thread sleeping for 1 minute.");
+                Thread.Sleep(60000);
+            }
+        }
+
+        // todo: when the backend database is implemented, have crawler take a queue ID.
+        public static int Crawler(object state) {
+            CrawlState queueEntry = (CrawlState)state;
+            if (queueEntry.crawlDepth < 0) {
+                return CRAWLSUCCESS;
+            }
+            string URL = queueEntry.URL;
+            // Check the page against the URL filter.
+            // todo: use proper error codes
+            if (URL == null) {
+                return CRAWLFAIL;
+            }
+            Uri webBase = new Uri(URL);
+            if (URL.Length > 512 || webBase.Host.Length > 256) {
+                return CRAWLTOOLONG;
+            }
+            if (webBase.Scheme != Uri.UriSchemeHttp && webBase.Scheme != Uri.UriSchemeHttps) {
+                return CRAWLNOTHTTP;
+            }
+            Random IDgenerator = new Random(queueEntry.rngSeed);
+            SqlConnection dbConn;
+            // Open connection to database.
+            try {
+                dbConn = new SqlConnection($"Server={config.sqlServer}; Database={config.sqlDB}; User Id={config.sqlUsername}; Password={config.sqlPassword}");
+                dbConn.Open();
+            } catch (Exception e) {
+                Console.WriteLine("Failed to connect to database! Error: " + e.Message);
+                return CRAWLFAIL;
+            }
+            // Sanitize the URL
+            string SQLsafeURL = URL.Replace("'", "''");
+            string SQLsafeDomain = webBase.Host.Replace("'", "''");
+            bool alreadyInIndex = false;
+            DateTime lastIndexed = DateTime.UtcNow;
+            Int64 pageID = 0;
+            byte[] IDraw = new byte[8];
+
+            // Check if the page has already been indexed
+            using (SqlCommand cmd = new SqlCommand($"SELECT ID, nextIndex, lastIndexed FROM Pages WHERE url = '{SQLsafeURL}';", dbConn)) {
+                using (SqlDataReader result = cmd.ExecuteReader()) {
+                    if (result.HasRows) {
+                        // If the page has already been indexed, figure out if it's time to index it again.
+                        result.Read();
+                        lastIndexed = (DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"));
+                        DateTime nextIndex = (DateTime)result.GetSqlDateTime(result.GetOrdinal("nextIndex"));
+                        if (nextIndex > DateTime.UtcNow) {
+                            // If not, return.
+                            dbConn.Close();
+                            return CRAWLLATER;
+                        }
+                        alreadyInIndex = true;
+                        pageID = result.GetInt64(result.GetOrdinal("ID"));
+                    } else {
+                        IDgenerator.NextBytes(IDraw);
+                        pageID = BitConverter.ToInt64(IDraw, 0);
+                    }
+                }
+            }
+
+            // Check Robots.txt
+            string rawRobots = "";
+            bool foundRobots = false;
+            DateTime nextAllowedCrawl = DateTime.UtcNow;
+            using (SqlCommand cmd = new SqlCommand($"SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}';", dbConn)) {
+                using (SqlDataReader result = cmd.ExecuteReader()) {
+                    if (result.HasRows) {
+                        // If we've already grabbed robots.txt, check how old it is.
+                        // If it's less than a day old, use it.
+                        result.Read();
+                        DateTime lastIndex = (DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"));
+                        nextAllowedCrawl = (DateTime)result.GetSqlDateTime(result.GetOrdinal("nextCrawl"));
+                        if (lastIndex + TimeSpan.FromDays(1) > DateTime.UtcNow) {
+                            rawRobots = result.GetString(result.GetOrdinal("robots"));
+                            goto parseRobots;
+                        }
+                        foundRobots = true;
+                    }
+                    // Else, get a new copy of robots.
+                    using (WebClient client = new WebClient()) {
+                        client.Headers.Add("User-Agent", userAgent);
+                        if (foundRobots) {
+                            client.Headers.Add("If-Modified-Since", ((DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"))).ToString("R"));
+                        }
+                        try {
+                            using (Stream file = client.OpenRead(new Uri(webBase, "/robots.txt"))) {
+                                using (StreamReader reader = new StreamReader(file)) {
+                                    rawRobots = reader.ReadToEnd();
+                                }
+                            }
+                        } catch (WebException e) {
+                            if (e.Status != WebExceptionStatus.ProtocolError) {
+                                Console.WriteLine("Failed to download robots.txt for " + new Uri(webBase, "/robots.txt").AbsoluteUri + "!");
+                                dbConn.Close();
+                                return CRAWLFAIL;
+                            }
+                            if (((HttpWebResponse)e.Response).StatusCode == HttpStatusCode.NotModified) {
+                                // Robots.txt hasn't been modified since we last checked. We can skip downloading.
+                                if (!foundRobots) {
+                                    throw e;
+                                }
+                                rawRobots = result.GetString(result.GetOrdinal("robots"));
+                            } else if (((HttpWebResponse)e.Response).StatusCode != HttpStatusCode.NotFound) {
+                                throw e;
+                            }
+                        }
+                    }
+                }
+            }
+            // Update the database
+            if (foundRobots) {
+                using (SqlCommand cmd = new SqlCommand($"UPDATE Robots SET robots = '{rawRobots.Replace("'", "''")}', lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}' WHERE domain = '{SQLsafeDomain}';", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+            } else {
+                using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}') INSERT INTO Robots (domain, robots, lastIndexed, nextCrawl) VALUES ('{SQLsafeDomain}', '{rawRobots.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow)}');", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+        parseRobots:
+            Robots.Robots robots = new Robots.Robots();
+            robots.LoadContent(rawRobots, new Uri(webBase, "/"));
+            if (!robots.Allowed(URL, userAgent) || nextAllowedCrawl > DateTime.UtcNow) {
+                // If we aren't allowed, don't crawl the page.
+                dbConn.Close();
+                return CRAWLNOTALLOWED;
+            }
+            int crawlDelay = robots.GetCrawlDelay(userAgent);
+            // Update the database to indicate that we've recently crawled this domain.
+            if (crawlDelay > 0) {
+                using (SqlCommand cmd = new SqlCommand($"UPDATE Robots SET nextCrawl = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(crawlDelay))}' WHERE domain = '{SQLsafeDomain}';", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            // Download the page.
+            HtmlDocument htmlDoc = new HtmlDocument();
+            bool isHtml = false;
+            string page = "";
+            using (WebClient client = new WebClient()) {
+                client.Headers.Add("User-Agent", userAgent);
+                if (alreadyInIndex) {
+                    client.Headers.Add("If-Modified-Since", lastIndexed.ToString("R"));
+                }
+                try {
+                    using (Stream file = client.OpenRead(URL)) {
+                        string mimeType = mimeTypeFilter.Match(client.ResponseHeaders["Content-Type"]).Groups[0].Captures[0].Value;
+                        if (mimeType == "text/plain") {
+                            using (StreamReader reader = new StreamReader(file)) {
+                                page = reader.ReadToEnd();
+                            }
+                        } else if (mimeType == "text/html") {
+                            using (StreamReader reader = new StreamReader(file)) {
+                                string rawHtml = reader.ReadToEnd();
+                                htmlDoc.LoadHtml(rawHtml);
+                                // Extract to the text
+                                HtmlNode body = htmlDoc.DocumentNode.SelectSingleNode("//body");
+                                if (body == null) {
+                                    Console.WriteLine("Failed to load URL! URL: " + URL + " Error: No body found.");
+                                    dbConn.Close();
+                                    return CRAWLFAIL;
+                                }
+                                page = htmlDoc.DocumentNode.SelectSingleNode("//body").InnerText;
+                                isHtml = true;
+                            }
+                        } else {
+                            dbConn.Close();
+                            Console.WriteLine($"URL: {URL} Mime type not plaintext or HTML!");
+                            return CRAWLFILTERED;
+                        }
+                    }
+                } catch (WebException e) {
+                    if (e.Status == WebExceptionStatus.ProtocolError && ((HttpWebResponse)e.Response).StatusCode == HttpStatusCode.NotModified) {
+                        // Page hasn't been modified since we last checked. We can skip downloading.
+                        dbConn.Close();
+                        return CRAWLSUCCESS;
+                    } else {
+                        Console.WriteLine("Failed to download page " + URL + "!");
+                        dbConn.Close();
+                        return CRAWLFAIL;
+                    }
+                }
+            }
+
+            // Add the page to the table of pages.
+            if (alreadyInIndex) {
+                using (SqlCommand cmd = new SqlCommand($"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', contents = '{page.Replace("'", "''")}' WHERE ID = {pageID};", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                using (SqlCommand cmd = new SqlCommand($"DELETE FROM PageIndex WHERE pageID = {pageID};", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+            } else {
+                using (SqlCommand cmd = new SqlCommand($"INSERT INTO Pages (ID, url, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);", dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            if (isHtml) {
+                SortedSet<string> links = new SortedSet<string>();
+                HtmlNodeCollection linkNodes = htmlDoc.DocumentNode.SelectNodes("//a[@href]");
+                if (linkNodes != null) {
+                    foreach (var node in htmlDoc.DocumentNode.SelectNodes("//a[@href]")) {
+                        try {
+                            string link = URLcleaner.Replace(new Uri(webBase, node.Attributes["href"].Value).AbsoluteUri, "");
+                            if (link.Length < 512 && URLFilter.IsMatch(link)) {
+                                links.Add(link.Replace("'", "''"));
+                            }
+                        } catch (UriFormatException e) {}
+                    }
+                    foreach (string link in links) {
+                        if (queueEntry.crawlDepth > 0) {
+                            IDgenerator.NextBytes(IDraw);
+                            Int64 ID = BitConverter.ToInt64(IDraw, 0);
+                            using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{link}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({ID}, '{link}', 0, '{new SqlDateTime(DateTime.Now)}', {queueEntry.crawlDepth - 1});", dbConn)) {
+                                cmd.ExecuteNonQuery();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Seperate the page into words.
+            char[] delimiters = { ' ' };
+            string[] words = cleaner.Replace(page, " ").ToLower().Split(delimiters, StringSplitOptions.RemoveEmptyEntries);
+            // Create the tree of word relations
+            SortedList<string, SortedSet<string>> wordEntries = new SortedList<string, SortedSet<string>>();
+            for (int i = 0; i < words.Length; i++) {
+                string word = words[i];
+                if (!wordEntries.ContainsKey(word)) {
+                    wordEntries[word] = new SortedSet<string>();
+                }
+                if (i > 0) {
+                    wordEntries[word].Add(words[i - 1]);
+                    if (i > 1) {
+                        wordEntries[word].Add(words[i - 2]);
+                    }
+                }
+                if (i < words.Length - 1) {
+                    wordEntries[word].Add(words[i + 1]);
+                    if (i < words.Length - 2) {
+                        wordEntries[word].Add(words[i + 2]);
+                    }
+                }
+            }
+            // Serialize neighbors lists to JSON
+            foreach (string word in wordEntries.Keys) {
+                if (word.Length < 64) {
+                    IDgenerator.NextBytes(IDraw);
+                    Int64 ID = BitConverter.ToInt64(IDraw, 0);
+                    string neighbors = JsonConvert.SerializeObject(wordEntries[word]);
+                    using (SqlCommand cmd = new SqlCommand($"INSERT INTO PageIndex (ID, word, neighbors, pageID) VALUES ({ID}, '{word.Replace("'", "''")}', '{neighbors.Replace("'", "''")}', {pageID});", dbConn)) {
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+            }
+            dbConn.Close();
+            return CRAWLSUCCESS;
+        }
+    }
+    public struct AskMeConfig {
+        public string sqlServer;
+		public string sqlUsername;
+		public string sqlPassword;
+        public string sqlDB;
+        public string filter;
+        public int crawlDepth;
+        public int threads;
+	}
+    class CrawlState {
+        public string URL;
+        public int crawlDepth;
+        public int rngSeed;
+        public Int64 ID;
+        public int attempts;
+        public CrawlState(string URL, int crawlDepth, int rngSeed, Int64 ID, int attempts) {
+            this.URL = URL;
+            this.crawlDepth = crawlDepth;
+            this.rngSeed = rngSeed;
+            this.ID = ID;
+            this.attempts = attempts;
+        }
+        public CrawlState() {
+            URL = "";
+            crawlDepth = -1;
+        }
+    }
+}
