@@ -18,9 +18,10 @@ namespace AskMe_Crawler {
     class Program {
         private static AskMeConfig config;
         private static Regex URLFilter;
-        private static Regex cleaner = new Regex(@"&(?!(#\d+|[a-z]+);)|;(?<!&(#\d+|[a-z]+);)|#(?<!&)(?!\d+;)|&nbsp;|&#32;|&#160;|&ensp;|&#8194;|&emsp;|&#8195;|[^a-z0-9'&#; ]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-        private static Regex URLcleaner = new Regex(@"#.+(?<!/.+#)$", RegexOptions.Compiled);
+        private static Regex cleaner = new Regex(@"[^a-z0-9' ]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static Regex mimeTypeFilter = new Regex(@"([a-z]+/)?[a-z0-9\-]+(?=;?)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static Regex titleCleaner = new Regex(@"^ +", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static Regex urlCleaner = new Regex(@"^[^&#]+", RegexOptions.Compiled);
         private const string userAgent = "AskMeCrawler/1.0";
         public const int CRAWLSUCCESS = 0;
         public const int CRAWLLATER = 1;
@@ -46,10 +47,10 @@ namespace AskMe_Crawler {
                 SqlConnection dbConn = new SqlConnection($"Server={config.sqlServer}; Database={config.sqlDB}; User Id={config.sqlUsername}; Password={config.sqlPassword}");
                 dbConn.Open();
                 // Create tables if they don't exist
-                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'PageIndex') BEGIN CREATE TABLE PageIndex (ID BIGINT PRIMARY KEY, word VARCHAR(64), neighbors TEXT, pageID BIGINT); CREATE INDEX idx_word ON PageIndex (word); CREATE INDEX idx_pageID ON PageIndex (pageID); END", dbConn)) {
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'PageIndex') BEGIN CREATE TABLE PageIndex (ID BIGINT PRIMARY KEY, word VARCHAR(64), neighbors TEXT, pageID BIGINT, domain VARCHAR(256)); CREATE INDEX idx_word ON PageIndex (word, domain); CREATE INDEX idx_pageID ON PageIndex (pageID); END", dbConn)) {
                     cmd.ExecuteNonQuery();
                 }
-                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Pages') BEGIN CREATE TABLE Pages (ID BIGINT PRIMARY KEY, url VARCHAR(512), lastIndexed DATETIME, nextIndex DATETIME, contents TEXT, crawlDepth INT, clicks INT); CREATE UNIQUE INDEX idx_url ON Pages (url); CREATE INDEX idx_nextIndex ON Pages (nextIndex); END", dbConn)) {
+                using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Pages') BEGIN CREATE TABLE Pages (ID BIGINT PRIMARY KEY, url VARCHAR(512), title TEXT, lastIndexed DATETIME, nextIndex DATETIME, contents TEXT, crawlDepth INT, clicks INT); CREATE UNIQUE INDEX idx_url ON Pages (url); CREATE INDEX idx_nextIndex ON Pages (nextIndex); END", dbConn)) {
                     cmd.ExecuteNonQuery();
                 }
                 using (SqlCommand cmd = new SqlCommand("IF NOT EXISTS (SELECT * FROM sys.tables t WHERE t.name = 'Robots') BEGIN CREATE TABLE Robots (domain VARCHAR(256) PRIMARY KEY, robots TEXT, lastIndexed DATETIME, nextCrawl DATETIME); END", dbConn)) {
@@ -225,13 +226,11 @@ namespace AskMe_Crawler {
                                 using (SqlCommand cmd = new SqlCommand($"DELETE FROM Queue WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
                                     cmd.ExecuteNonQuery();
                                 }
+                                Console.WriteLine("Page " + ((CrawlState)thread.AsyncState).URL + " indexed!");
                             } else {
                                 using (SqlCommand cmd = new SqlCommand($"UPDATE Queue SET attempts = {((CrawlState)thread.AsyncState).attempts + 1}, nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + rand.Next(0, 172800)))}' WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
                                     cmd.ExecuteNonQuery();
                                 }
-                            }
-                            if (thread.Result == 0) {
-                                Console.WriteLine("Page " + ((CrawlState)thread.AsyncState).URL + " indexed!");
                             }
                             threads[index] = Task<int>.Factory.StartNew(Crawler, new CrawlState((string)row["url"], (int)row["crawlDepth"], rand.Next(), (Int64)row["ID"], (int)row["attempts"]));
                         }
@@ -281,13 +280,21 @@ namespace AskMe_Crawler {
             if (URL == null) {
                 return CRAWLFAIL;
             }
+            if (!URLFilter.IsMatch(URL)) {
+                return CRAWLFILTERED;
+            }
             Uri webBase = new Uri(URL);
             if (URL.Length > 512 || webBase.Host.Length > 256) {
                 return CRAWLTOOLONG;
             }
+            // Reject hosts the operator doesn't want to crawl.
+            if (config.reject.Contains(webBase.Host)) {
+                return CRAWLFILTERED;
+            }
             if (webBase.Scheme != Uri.UriSchemeHttp && webBase.Scheme != Uri.UriSchemeHttps) {
                 return CRAWLNOTHTTP;
             }
+            URL = urlCleaner.Match(URL).Value;
             Random IDgenerator = new Random(queueEntry.rngSeed);
             SqlConnection dbConn;
             // Open connection to database.
@@ -302,19 +309,21 @@ namespace AskMe_Crawler {
             string SQLsafeURL = URL.Replace("'", "''");
             string SQLsafeDomain = webBase.Host.Replace("'", "''");
             bool alreadyInIndex = false;
+            int oldCrawlDepth = queueEntry.crawlDepth + 1;
             DateTime lastIndexed = DateTime.UtcNow;
-            Int64 pageID = 0;
+            Int64 pageID;
             byte[] IDraw = new byte[8];
 
             // Check if the page has already been indexed
-            using (SqlCommand cmd = new SqlCommand($"SELECT ID, nextIndex, lastIndexed FROM Pages WHERE url = '{SQLsafeURL}';", dbConn)) {
+            using (SqlCommand cmd = new SqlCommand($"SELECT ID, nextIndex, lastIndexed, crawlDepth FROM Pages WHERE url = '{SQLsafeURL}';", dbConn)) {
                 using (SqlDataReader result = cmd.ExecuteReader()) {
                     if (result.HasRows) {
                         // If the page has already been indexed, figure out if it's time to index it again.
                         result.Read();
                         lastIndexed = (DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"));
                         DateTime nextIndex = (DateTime)result.GetSqlDateTime(result.GetOrdinal("nextIndex"));
-                        if (nextIndex > DateTime.UtcNow) {
+                        oldCrawlDepth = (int)result.GetInt32(result.GetOrdinal("crawlDepth"));
+                        if (nextIndex > DateTime.UtcNow && oldCrawlDepth >= queueEntry.crawlDepth) {
                             // If not, return.
                             dbConn.Close();
                             return CRAWLLATER;
@@ -334,11 +343,12 @@ namespace AskMe_Crawler {
             DateTime nextAllowedCrawl = DateTime.UtcNow;
             using (SqlCommand cmd = new SqlCommand($"SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}';", dbConn)) {
                 using (SqlDataReader result = cmd.ExecuteReader()) {
+                    DateTime lastIndex = DateTime.UtcNow;
                     if (result.HasRows) {
                         // If we've already grabbed robots.txt, check how old it is.
                         // If it's less than a day old, use it.
                         result.Read();
-                        DateTime lastIndex = (DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"));
+                        lastIndex = (DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"));
                         nextAllowedCrawl = (DateTime)result.GetSqlDateTime(result.GetOrdinal("nextCrawl"));
                         if (lastIndex + TimeSpan.FromDays(1) > DateTime.UtcNow) {
                             rawRobots = result.GetString(result.GetOrdinal("robots"));
@@ -349,18 +359,23 @@ namespace AskMe_Crawler {
                     // Else, get a new copy of robots.
                     using (WebClient client = new WebClient()) {
                         client.Headers.Add("User-Agent", userAgent);
-                        if (foundRobots) {
-                            client.Headers.Add("If-Modified-Since", ((DateTime)result.GetSqlDateTime(result.GetOrdinal("lastIndexed"))).ToString("R"));
-                        }
                         try {
                             using (Stream file = client.OpenRead(new Uri(webBase, "/robots.txt"))) {
+                                // Check if robots.txt has been modified since we last crawled it.
+                                if (client.ResponseHeaders[HttpResponseHeader.LastModified] != null) {
+                                    DateTime lastModified = DateTime.Parse(client.ResponseHeaders[HttpResponseHeader.LastModified]);
+                                    if (foundRobots && lastIndex >= lastModified) {
+                                        // If it has not been modified, don't bother reading it..
+                                        goto parseRobots;
+                                    }
+                                }
                                 using (StreamReader reader = new StreamReader(file)) {
                                     rawRobots = reader.ReadToEnd();
                                 }
                             }
                         } catch (WebException e) {
                             if (e.Status != WebExceptionStatus.ProtocolError) {
-                                Console.WriteLine("Failed to download robots.txt for " + new Uri(webBase, "/robots.txt").AbsoluteUri + "!");
+                                Console.WriteLine("Failed to download robots.txt for " + new Uri(webBase, "/").AbsoluteUri + "!");
                                 dbConn.Close();
                                 return CRAWLFAIL;
                             }
@@ -408,30 +423,40 @@ namespace AskMe_Crawler {
             HtmlDocument htmlDoc = new HtmlDocument();
             bool isHtml = false;
             string page = "";
+            string title = "";
             using (WebClient client = new WebClient()) {
-                client.Headers.Add("User-Agent", userAgent);
-                if (alreadyInIndex) {
-                    client.Headers.Add("If-Modified-Since", lastIndexed.ToString("R"));
-                }
+                client.Headers.Add(HttpRequestHeader.UserAgent, userAgent);
                 try {
                     using (Stream file = client.OpenRead(URL)) {
-                        string mimeType = mimeTypeFilter.Match(client.ResponseHeaders["Content-Type"]).Groups[0].Captures[0].Value;
+                        // Check if the page has been modified since we last crawled it.
+                        if (client.ResponseHeaders[HttpResponseHeader.LastModified] != null) {
+                            DateTime lastModified = DateTime.Parse(client.ResponseHeaders[HttpResponseHeader.LastModified]);
+                            if (alreadyInIndex && lastIndexed >= lastModified && oldCrawlDepth >= queueEntry.crawlDepth) {
+                                // If it has not been modified, return.
+                                dbConn.Close();
+                                return CRAWLLATER;
+                            }
+                        }
+                        string mimeType = mimeTypeFilter.Match(client.ResponseHeaders[HttpResponseHeader.ContentType]).Value;
                         if (mimeType == "text/plain") {
                             using (StreamReader reader = new StreamReader(file)) {
                                 page = reader.ReadToEnd();
                             }
-                        } else if (mimeType == "text/html") {
+                        } else if (mimeType == "text/html" || mimeType == "text/xml") {
                             using (StreamReader reader = new StreamReader(file)) {
                                 string rawHtml = reader.ReadToEnd();
                                 htmlDoc.LoadHtml(rawHtml);
-                                // Extract to the text
-                                HtmlNode body = htmlDoc.DocumentNode.SelectSingleNode("//body");
-                                if (body == null) {
-                                    Console.WriteLine("Failed to load URL! URL: " + URL + " Error: No body found.");
+                                // Extract the text
+                                page = htmlDoc.DocumentNode.InnerText;
+                                if (page == null) {
+                                    Console.WriteLine("Failed to load URL! URL: " + URL + " Error: No text found.");
                                     dbConn.Close();
                                     return CRAWLFAIL;
                                 }
-                                page = htmlDoc.DocumentNode.SelectSingleNode("//body").InnerText;
+                                HtmlNode titleElement = htmlDoc.DocumentNode.SelectSingleNode("//title");
+                                if (titleElement != null && titleElement.InnerText != null) {
+                                    title = titleElement.InnerText;
+                                }
                                 isHtml = true;
                             }
                         } else {
@@ -440,42 +465,46 @@ namespace AskMe_Crawler {
                             return CRAWLFILTERED;
                         }
                     }
-                } catch (WebException e) {
-                    if (e.Status == WebExceptionStatus.ProtocolError && ((HttpWebResponse)e.Response).StatusCode == HttpStatusCode.NotModified) {
-                        // Page hasn't been modified since we last checked. We can skip downloading.
-                        dbConn.Close();
-                        return CRAWLSUCCESS;
-                    } else {
-                        Console.WriteLine("Failed to download page " + URL + "!");
-                        dbConn.Close();
-                        return CRAWLFAIL;
-                    }
+                } catch (Exception e) {
+                    Console.WriteLine("Failed to download page " + URL + " !");
+                    dbConn.Close();
+                    return CRAWLFAIL;
                 }
             }
+
+            if (title == "") {
+                title = webBase.Segments[webBase.Segments.Length - 1];
+            }
+
+            title = titleCleaner.Replace(title, "");
+
+            // Consolidate all of the SQL queries into one;
+            string query;
+            string newQuery;
 
             // Add the page to the table of pages.
             if (alreadyInIndex) {
-                using (SqlCommand cmd = new SqlCommand($"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', contents = '{page.Replace("'", "''")}' WHERE ID = {pageID};", dbConn)) {
-                    cmd.ExecuteNonQuery();
-                }
-                using (SqlCommand cmd = new SqlCommand($"DELETE FROM PageIndex WHERE pageID = {pageID};", dbConn)) {
-                    cmd.ExecuteNonQuery();
-                }
+                query = $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
             } else {
-                using (SqlCommand cmd = new SqlCommand($"INSERT INTO Pages (ID, url, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);", dbConn)) {
-                    cmd.ExecuteNonQuery();
-                }
+                query = $"INSERT INTO Pages (ID, url, title, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{title.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);";
             }
 
             if (isHtml) {
-                SortedSet<string> links = new SortedSet<string>();
+                HashSet<string> links = new HashSet<string>();
                 HtmlNodeCollection linkNodes = htmlDoc.DocumentNode.SelectNodes("//a[@href]");
                 if (linkNodes != null) {
                     foreach (var node in htmlDoc.DocumentNode.SelectNodes("//a[@href]")) {
                         try {
-                            string link = URLcleaner.Replace(new Uri(webBase, node.Attributes["href"].Value).AbsoluteUri, "");
-                            if (link.Length < 512 && URLFilter.IsMatch(link)) {
-                                links.Add(link.Replace("'", "''"));
+                            // Make sure the link is well formed.
+                            if (node.Attributes["href"] != null) {
+                                Uri href = new Uri(webBase, node.Attributes["href"].Value);
+                                if ((href.Scheme == Uri.UriSchemeHttp || href.Scheme == Uri.UriSchemeHttps) &&
+                                        !config.reject.Contains(href.Host)) {
+                                    string link = urlCleaner.Match(href.AbsoluteUri).Value;
+                                    if (link.Length < 512 && URLFilter.IsMatch(link)) {
+                                        links.Add(link.Replace("'", "''"));
+                                    }
+                                }
                             }
                         } catch (UriFormatException e) {}
                     }
@@ -483,9 +512,14 @@ namespace AskMe_Crawler {
                         if (queueEntry.crawlDepth > 0) {
                             IDgenerator.NextBytes(IDraw);
                             Int64 ID = BitConverter.ToInt64(IDraw, 0);
-                            using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{link}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({ID}, '{link}', 0, '{new SqlDateTime(DateTime.Now)}', {queueEntry.crawlDepth - 1});", dbConn)) {
-                                cmd.ExecuteNonQuery();
+                            newQuery = $"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{link}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({ID}, '{link}', 0, '{new SqlDateTime(DateTime.UtcNow)}', {queueEntry.crawlDepth - 1});";
+                            if (query.Length + newQuery.Length > 524288) {
+                                using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
+                                    cmd.ExecuteNonQuery();
+                                }
+                                query = "";
                             }
+                            query += newQuery;
                         }
                     }
                 }
@@ -495,11 +529,11 @@ namespace AskMe_Crawler {
             char[] delimiters = { ' ' };
             string[] words = cleaner.Replace(page, " ").ToLower().Split(delimiters, StringSplitOptions.RemoveEmptyEntries);
             // Create the tree of word relations
-            SortedList<string, SortedSet<string>> wordEntries = new SortedList<string, SortedSet<string>>();
+            Dictionary<string, HashSet<string>> wordEntries = new Dictionary<string, HashSet<string>>();
             for (int i = 0; i < words.Length; i++) {
                 string word = words[i];
                 if (!wordEntries.ContainsKey(word)) {
-                    wordEntries[word] = new SortedSet<string>();
+                    wordEntries[word] = new HashSet<string>();
                 }
                 if (i > 0) {
                     wordEntries[word].Add(words[i - 1]);
@@ -515,15 +549,25 @@ namespace AskMe_Crawler {
                 }
             }
             // Serialize neighbors lists to JSON
-            foreach (string word in wordEntries.Keys) {
+            foreach (KeyValuePair<string, HashSet<string>> wordEntry in wordEntries) {
+                string word = wordEntry.Key;
                 if (word.Length < 64) {
                     IDgenerator.NextBytes(IDraw);
                     Int64 ID = BitConverter.ToInt64(IDraw, 0);
-                    string neighbors = JsonConvert.SerializeObject(wordEntries[word]);
-                    using (SqlCommand cmd = new SqlCommand($"INSERT INTO PageIndex (ID, word, neighbors, pageID) VALUES ({ID}, '{word.Replace("'", "''")}', '{neighbors.Replace("'", "''")}', {pageID});", dbConn)) {
-                        cmd.ExecuteNonQuery();
+                    string neighbors = JsonConvert.SerializeObject(wordEntry.Value);
+                    newQuery = $"INSERT INTO PageIndex (ID, word, neighbors, pageID, domain) VALUES ({ID}, '{word.Replace("'", "''")}', '{neighbors.Replace("'", "''")}', {pageID}, '{SQLsafeDomain}');";
+                    if (query.Length + newQuery.Length > 524288) {
+                        using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
+                            cmd.ExecuteNonQuery();
+                        }
+                        query = "";
                     }
+                    query += newQuery;
                 }
+            }
+            // Execute the final query.
+            using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
+                cmd.ExecuteNonQuery();
             }
             dbConn.Close();
             return CRAWLSUCCESS;
@@ -535,6 +579,7 @@ namespace AskMe_Crawler {
 		public string sqlPassword;
         public string sqlDB;
         public string filter;
+        public HashSet<string> reject;
         public int crawlDepth;
         public int threads;
 	}
