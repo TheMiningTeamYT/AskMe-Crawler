@@ -1,0 +1,10 @@
+{
+  "sqlServer": "server",
+  "sqlUsername": "username",
+  "sqlPassword": "password",
+  "sqlDB": "search",
+  "filter": "^https?://[a-z0-9\\-.]*(\\.retro|\\.cghmn|\\.chivanet|\\.goat)(?:/.*)?",
+  "reject": [],
+  "crawlDepth": 3,
+  "threads": 64
+}
