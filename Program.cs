@@ -356,8 +356,6 @@ namespace AskMe_Crawler {
             if (webBase.Scheme != Uri.UriSchemeHttp && webBase.Scheme != Uri.UriSchemeHttps) {
                 return CRAWLNOTHTTP;
             }
-            URL = urlCleaner.Match(URL).Value;
-            Random IDgenerator = new Random(queueEntry.rngSeed);
             SqlConnection dbConn;
             // Open connection to database.
             try {
@@ -367,133 +365,158 @@ namespace AskMe_Crawler {
                 Console.WriteLine("Failed to connect to database! Error: " + e.Message);
                 return CRAWLFAIL;
             }
-            // Sanitize the URL
-            string SQLsafeURL = URL.Replace("'", "''");
-            string SQLsafeDomain = webBase.Host.Replace("'", "''");
+            // Connect to the web server to detect redirects.
+            // (But only actually download the page if we need to.)
+            WebRequest request = WebRequest.Create(URL);
+            int crawlDelay;
+            HtmlDocument htmlDoc = new HtmlDocument();
+            // Variables we will need outside the web request scope.
+            bool isHtml;
+            string page;
+            string title = "";
             bool alreadyInIndex = false;
-            int oldCrawlDepth = queueEntry.crawlDepth + 1;
-            DateTime lastIndexed = DateTime.UtcNow;
-            Int64 pageID;
+            Random IDgenerator = new Random(queueEntry.rngSeed);
             byte[] IDraw = new byte[8];
+            Int64 pageID;
+            string SQLsafeURL;
+            string SQLsafeDomain;
+            try {
+                using (WebResponse response = request.GetResponse()) {
+                    webBase = response.ResponseUri;
+                    URL = urlCleaner.Match(webBase.ToString()).Value;
 
-            // Check if the page has already been indexed
-            using (SqlCommand cmd = new SqlCommand($"SELECT ID, nextIndex, lastIndexed, crawlDepth FROM Pages WHERE url = '{SQLsafeURL}';", dbConn)) {
-                using (SqlDataReader result = cmd.ExecuteReader()) {
-                    if (result.HasRows) {
-                        // If the page has already been indexed, figure out if it's time to index it again.
-                        result.Read();
-                        lastIndexed = result.GetDateTime(result.GetOrdinal("lastIndexed"));
-                        DateTime nextIndex = result.GetDateTime(result.GetOrdinal("nextIndex"));
-                        oldCrawlDepth = result.GetInt32(result.GetOrdinal("crawlDepth"));
-                        if (nextIndex > DateTime.UtcNow && oldCrawlDepth >= queueEntry.crawlDepth) {
-                            // If not, return.
-                            dbConn.Close();
-                            return CRAWLLATER;
-                        }
-                        alreadyInIndex = true;
-                        pageID = result.GetInt64(result.GetOrdinal("ID"));
-                    } else {
-                        IDgenerator.NextBytes(IDraw);
-                        pageID = BitConverter.ToInt64(IDraw, 0);
+                    if (URL.Length > 512 || webBase.Host.Length > 256) {
+                        dbConn.Close();
+                        return CRAWLTOOLONG;
                     }
-                }
-            }
 
-            // Check Robots.txt
-            string rawRobots = "";
-            bool foundRobots = false;
-            DateTime nextAllowedCrawl = DateTime.UtcNow;
-            using (SqlCommand cmd = new SqlCommand($"SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}';", dbConn)) {
-                using (SqlDataReader result = cmd.ExecuteReader()) {
-                    DateTime lastIndex = DateTime.UtcNow;
-                    if (result.HasRows) {
-                        // If we've already grabbed robots.txt, check how old it is.
-                        // If it's less than a day old, use it.
-                        result.Read();
-                        lastIndex = result.GetDateTime(result.GetOrdinal("lastIndexed"));
-                        nextAllowedCrawl = result.GetDateTime(result.GetOrdinal("nextCrawl"));
-                        if (lastIndex + TimeSpan.FromDays(1) > DateTime.UtcNow) {
-                            rawRobots = result.GetString(result.GetOrdinal("robots"));
-                            goto parseRobots;
-                        }
-                        foundRobots = true;
+                    // Reject hosts the operator doesn't want to crawl.
+                    if (config.reject.Contains(webBase.Host)) {
+                        dbConn.Close();
+                        return CRAWLFILTERED;
                     }
-                    // Else, get a new copy of robots.
-                    using (WebClient client = new WebClient()) {
-                        client.Headers.Add("User-Agent", userAgent);
-                        try {
-                            using (Stream file = client.OpenRead(new Uri(webBase, "/robots.txt"))) {
-                                // Check if robots.txt has been modified since we last crawled it.
-                                if (client.ResponseHeaders[HttpResponseHeader.LastModified] != null) {
-                                    DateTime lastModified = DateTime.Parse(client.ResponseHeaders[HttpResponseHeader.LastModified]);
-                                    if (foundRobots && lastIndex >= lastModified) {
-                                        // If it has not been modified, don't bother reading it.
-                                        goto updateRobots;
+                    if (webBase.Scheme != Uri.UriSchemeHttp && webBase.Scheme != Uri.UriSchemeHttps) {
+                        dbConn.Close();
+                        return CRAWLNOTHTTP;
+                    }
+
+                    // Sanitize the URL
+                    SQLsafeURL = URL.Replace("'", "''");
+                    SQLsafeDomain = webBase.Host.Replace("'", "''");
+                    int oldCrawlDepth = queueEntry.crawlDepth + 1;
+                    DateTime lastIndexed = DateTime.UtcNow;
+
+                    // Check if the page has already been indexed
+                    using (SqlCommand cmd = new SqlCommand($"SELECT ID, nextIndex, lastIndexed, crawlDepth FROM Pages WHERE url = '{SQLsafeURL}';", dbConn)) {
+                        using (SqlDataReader result = cmd.ExecuteReader()) {
+                            if (result.HasRows) {
+                                // If the page has already been indexed, figure out if it's time to index it again.
+                                result.Read();
+                                lastIndexed = result.GetDateTime(result.GetOrdinal("lastIndexed"));
+                                DateTime nextIndex = result.GetDateTime(result.GetOrdinal("nextIndex"));
+                                oldCrawlDepth = result.GetInt32(result.GetOrdinal("crawlDepth"));
+                                if (nextIndex > DateTime.UtcNow && oldCrawlDepth >= queueEntry.crawlDepth) {
+                                    // If not, return.
+                                    dbConn.Close();
+                                    return CRAWLLATER;
+                                }
+                                alreadyInIndex = true;
+                                pageID = result.GetInt64(result.GetOrdinal("ID"));
+                            } else {
+                                IDgenerator.NextBytes(IDraw);
+                                pageID = BitConverter.ToInt64(IDraw, 0);
+                            }
+                        }
+                    }
+
+                    // Check Robots.txt
+                    string rawRobots = "";
+                    bool foundRobots = false;
+                    DateTime nextAllowedCrawl = DateTime.UtcNow;
+                    using (SqlCommand cmd = new SqlCommand($"SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}';", dbConn)) {
+                        using (SqlDataReader result = cmd.ExecuteReader()) {
+                            DateTime lastIndex = DateTime.UtcNow;
+                            if (result.HasRows) {
+                                // If we've already grabbed robots.txt, check how old it is.
+                                // If it's less than a day old, use it.
+                                result.Read();
+                                lastIndex = result.GetDateTime(result.GetOrdinal("lastIndexed"));
+                                nextAllowedCrawl = result.GetDateTime(result.GetOrdinal("nextCrawl"));
+                                if (lastIndex + TimeSpan.FromDays(1) > DateTime.UtcNow) {
+                                    rawRobots = result.GetString(result.GetOrdinal("robots"));
+                                    goto parseRobots;
+                                }
+                                foundRobots = true;
+                            }
+                            // Else, get a new copy of robots.
+                            using (WebClient client = new WebClient()) {
+                                client.Headers.Add("User-Agent", userAgent);
+                                try {
+                                    using (Stream file = client.OpenRead(new Uri(webBase, "/robots.txt"))) {
+                                        // Check if robots.txt has been modified since we last crawled it.
+                                        if (client.ResponseHeaders[HttpResponseHeader.LastModified] != null) {
+                                            DateTime lastModified = DateTime.Parse(client.ResponseHeaders[HttpResponseHeader.LastModified]);
+                                            if (foundRobots && lastIndex >= lastModified) {
+                                                // If it has not been modified, don't bother reading it.
+                                                goto updateRobots;
+                                            }
+                                        }
+                                        using (StreamReader reader = new StreamReader(file)) {
+                                            rawRobots = reader.ReadToEnd();
+                                        }
+                                    }
+                                } catch (WebException e) {
+                                    if (e.Status != WebExceptionStatus.ProtocolError) {
+                                        Console.WriteLine("Failed to download robots.txt for " + new Uri(webBase, "/").AbsoluteUri + "!");
+                                        dbConn.Close();
+                                        return CRAWLFAIL;
+                                    }
+                                    if (((HttpWebResponse)e.Response).StatusCode == HttpStatusCode.NotModified) {
+                                        // Robots.txt hasn't been modified since we last checked. We can skip downloading.
+                                        if (!foundRobots) {
+                                            throw e;
+                                        }
+                                        rawRobots = result.GetString(result.GetOrdinal("robots"));
+                                    } else if (((HttpWebResponse)e.Response).StatusCode != HttpStatusCode.NotFound) {
+                                        throw e;
                                     }
                                 }
-                                using (StreamReader reader = new StreamReader(file)) {
-                                    rawRobots = reader.ReadToEnd();
-                                }
-                            }
-                        } catch (WebException e) {
-                            if (e.Status != WebExceptionStatus.ProtocolError) {
-                                Console.WriteLine("Failed to download robots.txt for " + new Uri(webBase, "/").AbsoluteUri + "!");
-                                dbConn.Close();
-                                return CRAWLFAIL;
-                            }
-                            if (((HttpWebResponse)e.Response).StatusCode == HttpStatusCode.NotModified) {
-                                // Robots.txt hasn't been modified since we last checked. We can skip downloading.
-                                if (!foundRobots) {
-                                    throw e;
-                                }
-                                rawRobots = result.GetString(result.GetOrdinal("robots"));
-                            } else if (((HttpWebResponse)e.Response).StatusCode != HttpStatusCode.NotFound) {
-                                throw e;
                             }
                         }
                     }
-                }
-            }
-        updateRobots:
-            // Update the database
-            if (foundRobots) {
-                using (SqlCommand cmd = new SqlCommand($"UPDATE Robots SET robots = '{rawRobots.Replace("'", "''")}', lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}' WHERE domain = '{SQLsafeDomain}';", dbConn)) {
-                    cmd.ExecuteNonQuery();
-                }
-            } else {
-                using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}') INSERT INTO Robots (domain, robots, lastIndexed, nextCrawl) VALUES ('{SQLsafeDomain}', '{rawRobots.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow)}');", dbConn)) {
-                    cmd.ExecuteNonQuery();
-                }
-            }
+                updateRobots:
+                    // Update the database
+                    if (foundRobots) {
+                        using (SqlCommand cmd = new SqlCommand($"UPDATE Robots SET robots = '{rawRobots.Replace("'", "''")}', lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}' WHERE domain = '{SQLsafeDomain}';", dbConn)) {
+                            cmd.ExecuteNonQuery();
+                        }
+                    } else {
+                        using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Robots WHERE domain = '{SQLsafeDomain}') INSERT INTO Robots (domain, robots, lastIndexed, nextCrawl) VALUES ('{SQLsafeDomain}', '{rawRobots.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow)}');", dbConn)) {
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
 
-        parseRobots:
-            Robots.Robots robots = new Robots.Robots();
-            robots.LoadContent(rawRobots, new Uri(webBase, "/"));
-            if (!robots.Allowed(URL, userAgent) || nextAllowedCrawl > DateTime.UtcNow) {
-                // If we aren't allowed, don't crawl the page.
-                dbConn.Close();
-                return CRAWLNOTALLOWED;
-            }
-            int crawlDelay = robots.GetCrawlDelay(userAgent);
-            // Update the database to indicate that we've recently crawled this domain.
-            if (crawlDelay > 0) {
-                using (SqlCommand cmd = new SqlCommand($"UPDATE Robots SET nextCrawl = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(crawlDelay))}' WHERE domain = '{SQLsafeDomain}';", dbConn)) {
-                    cmd.ExecuteNonQuery();
-                }
-            }
+                parseRobots:
+                    Robots.Robots robots = new Robots.Robots();
+                    robots.LoadContent(rawRobots, new Uri(webBase, "/"));
+                    if (!robots.Allowed(URL, userAgent) || nextAllowedCrawl > DateTime.UtcNow) {
+                        // If we aren't allowed, don't crawl the page.
+                        dbConn.Close();
+                        return CRAWLNOTALLOWED;
+                    }
+                    crawlDelay = robots.GetCrawlDelay(userAgent);
+                    // Update the database to indicate that we've recently crawled this domain.
+                    if (crawlDelay > 0) {
+                        using (SqlCommand cmd = new SqlCommand($"UPDATE Robots SET nextCrawl = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(crawlDelay))}' WHERE domain = '{SQLsafeDomain}';", dbConn)) {
+                            cmd.ExecuteNonQuery();
+                        }
+                    }
 
-            // Download the page.
-            HtmlDocument htmlDoc = new HtmlDocument();
-            bool isHtml = false;
-            string page = "";
-            string title = "";
-            using (WebClient client = new WebClient()) {
-                client.Headers.Add(HttpRequestHeader.UserAgent, userAgent);
-                try {
-                    using (Stream file = client.OpenRead(URL)) {
+                    // Download the page.
+                    using (Stream file = response.GetResponseStream()) {
                         // Check if the page has been modified since we last crawled it.
-                        if (client.ResponseHeaders[HttpResponseHeader.LastModified] != null) {
-                            DateTime lastModified = DateTime.Parse(client.ResponseHeaders[HttpResponseHeader.LastModified]);
+                        if (response.Headers[HttpResponseHeader.LastModified] != null) {
+                            DateTime lastModified = DateTime.Parse(response.Headers[HttpResponseHeader.LastModified]);
                             if (alreadyInIndex && lastIndexed >= lastModified && oldCrawlDepth >= queueEntry.crawlDepth) {
                                 // If it has not been modified, return.
                                 using (SqlCommand cmd = new SqlCommand($"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}", dbConn)) {
@@ -503,11 +526,12 @@ namespace AskMe_Crawler {
                                 return CRAWLLATER;
                             }
                         }
-                        string mimeType = mimeTypeFilter.Match(client.ResponseHeaders[HttpResponseHeader.ContentType]).Value;
+                        string mimeType = mimeTypeFilter.Match(response.Headers[HttpResponseHeader.ContentType]).Value;
                         if (mimeType == "text/plain") {
                             using (StreamReader reader = new StreamReader(file)) {
                                 page = reader.ReadToEnd();
                             }
+                            isHtml = false;
                         } else if (mimeType == "text/html" || mimeType == "text/xml") {
                             using (StreamReader reader = new StreamReader(file)) {
                                 string rawHtml = reader.ReadToEnd();
@@ -531,11 +555,11 @@ namespace AskMe_Crawler {
                             return CRAWLFILTERED;
                         }
                     }
-                } catch (Exception e) {
-                    Console.WriteLine("Failed to download page " + URL + " !");
-                    dbConn.Close();
-                    return CRAWLFAIL;
                 }
+            } catch (Exception e) {
+                Console.WriteLine("Failed to download page " + URL + " !");
+                dbConn.Close();
+                return CRAWLFAIL;
             }
 
             if (title == "") {
@@ -545,14 +569,14 @@ namespace AskMe_Crawler {
             title = titleCleaner.Replace(title, "");
 
             // Consolidate all of the SQL queries into one;
-            string query;
+            string query = "BEGIN TRANSACTION;";
             string newQuery;
 
             // Add the page to the table of pages.
             if (alreadyInIndex) {
-                query = $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
+                query += $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
             } else {
-                query = $"INSERT INTO Pages (ID, url, title, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{title.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);";
+                query += $"INSERT INTO Pages (ID, url, title, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{title.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);";
             }
 
             if (isHtml) {
@@ -572,7 +596,7 @@ namespace AskMe_Crawler {
                                     }
                                 }
                             }
-                        } catch (UriFormatException e) {}
+                        } catch (UriFormatException e) { }
                     }
                     foreach (string link in links) {
                         if (queueEntry.crawlDepth > 0) {
@@ -632,6 +656,7 @@ namespace AskMe_Crawler {
                 }
             }
             // Execute the final query.
+            query += "COMMIT;";
             using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
                 cmd.ExecuteNonQuery();
             }
