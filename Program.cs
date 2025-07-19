@@ -27,9 +27,9 @@ namespace AskMe_Crawler {
         public const int CRAWLLATER = 1;
         public const int CRAWLFILTERED = 2;
         public const int CRAWLTOOLONG = 3;
-        public const int CRAWLNOTALLOWED = 4;
         public const int CRAWLNOTHTTP = 5;
         public const int CRAWLFAIL = -1;
+        public const int CRAWLNOTALLOWED = -2;
         static void Main(string[] args) {
             // Open config file.
             using (FileStream configFile = File.OpenRead("askme.json")) {
@@ -299,6 +299,12 @@ namespace AskMe_Crawler {
                     }
                     foreach (Task<int> thread in threads) {
                         if (thread != null) {
+                            if (thread.Result != CRAWLSUCCESS && ((CrawlState)thread.AsyncState).attempts > 2) {
+                                // If the page we failed to crawl was in the index, remove it from the index.
+                                using (SqlCommand cmd = new SqlCommand($"BEGIN TRANSACTION; DELETE FROM PageIndex WHERE pageID IN (SELECT ID FROM Pages WHERE url = '{((CrawlState)thread.AsyncState).URL.Replace("'", "''")}'); DELETE FROM Pages WHERE url = '{((CrawlState)thread.AsyncState).URL.Replace("'", "''")}'; COMMIT;", dbConn)) {
+                                    cmd.ExecuteNonQuery();
+                                }
+                            }
                             if (thread.Result >= 0 || ((CrawlState)thread.AsyncState).attempts > 2) {
                                 using (SqlCommand cmd = new SqlCommand($"DELETE FROM Queue WHERE ID = {((CrawlState)thread.AsyncState).ID};", dbConn)) {
                                     cmd.ExecuteNonQuery();
@@ -315,13 +321,15 @@ namespace AskMe_Crawler {
                 // Queue pages that haven't been indexed in a while.
                 queue = new DataSet();
                 adapter = new SqlDataAdapter {
-                    SelectCommand = new SqlCommand($"SELECT url, nextIndex, crawlDepth FROM Pages WHERE nextIndex < '{new SqlDateTime(DateTime.UtcNow)}';", dbConn)
+                    SelectCommand = new SqlCommand($"SELECT * FROM Pages WHERE nextIndex < '{new SqlDateTime(DateTime.UtcNow)}';", dbConn)
                 };
                 adapter.Fill(queue);
                 byte[] IDraw = new byte[8];
                 foreach (DataRow row in queue.Tables[0].Rows) {
                     rand.NextBytes(IDraw);
-                    using (SqlCommand cmd = new SqlCommand($"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{((string)row["url"]).Replace("'", "''")}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({BitConverter.ToInt64(IDraw, 0)}, '{((string)row["url"]).Replace("'", "''")}', 0, '{new SqlDateTime((DateTime)row["nextIndex"])}', {(int)row["crawlDepth"]})", dbConn)) {
+                    // Make sure that a page which enters the queue is not reindexed again any time soon.
+                    using (SqlCommand cmd = new SqlCommand($"BEGIN TRANSACTION; IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{((string)row["url"]).Replace("'", "''")}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({BitConverter.ToInt64(IDraw, 0)}, '{((string)row["url"]).Replace("'", "''")}', 0, '{new SqlDateTime((DateTime)row["nextIndex"])}', {(int)row["crawlDepth"]}); " 
+                        + $"UPDATE Pages SET nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + rand.Next(0, 172800)))}' WHERE ID = {(Int64)row["ID"]}; COMMIT;", dbConn)) {
                         cmd.ExecuteNonQuery();
                     }
                 }
@@ -519,7 +527,7 @@ namespace AskMe_Crawler {
                             DateTime lastModified = DateTime.Parse(response.Headers[HttpResponseHeader.LastModified]);
                             if (alreadyInIndex && lastIndexed >= lastModified && oldCrawlDepth >= queueEntry.crawlDepth) {
                                 // If it has not been modified, return.
-                                using (SqlCommand cmd = new SqlCommand($"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}", dbConn)) {
+                                using (SqlCommand cmd = new SqlCommand($"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}", dbConn)) {
                                     cmd.ExecuteNonQuery();
                                 }
                                 dbConn.Close();
@@ -574,7 +582,7 @@ namespace AskMe_Crawler {
 
             // Add the page to the table of pages.
             if (alreadyInIndex) {
-                query += $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
+                query += $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
             } else {
                 query += $"INSERT INTO Pages (ID, url, title, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{title.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);";
             }
