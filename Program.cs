@@ -328,8 +328,8 @@ namespace AskMe_Crawler {
                 foreach (DataRow row in queue.Tables[0].Rows) {
                     rand.NextBytes(IDraw);
                     // Make sure that a page which enters the queue is not reindexed again any time soon.
-                    using (SqlCommand cmd = new SqlCommand($"BEGIN TRANSACTION; IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{((string)row["url"]).Replace("'", "''")}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({BitConverter.ToInt64(IDraw, 0)}, '{((string)row["url"]).Replace("'", "''")}', 0, '{new SqlDateTime((DateTime)row["nextIndex"])}', {(int)row["crawlDepth"]}); " 
-                        + $"UPDATE Pages SET nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + rand.Next(0, 172800)))}' WHERE ID = {(Int64)row["ID"]}; COMMIT;", dbConn)) {
+                    using (SqlCommand cmd = new SqlCommand($"BEGIN TRANSACTION; IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{((string)row["url"]).Replace("'", "''")}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({BitConverter.ToInt64(IDraw, 0)}, '{((string)row["url"]).Replace("'", "''")}', 0, '{new SqlDateTime((DateTime)row["nextIndex"])}', {(int)row["crawlDepth"]}); " +
+                        $"UPDATE Pages SET nextIndex = '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + rand.Next(0, 172800)))}' WHERE ID = {(Int64)row["ID"]}; COMMIT;", dbConn)) {
                         cmd.ExecuteNonQuery();
                     }
                 }
@@ -373,22 +373,22 @@ namespace AskMe_Crawler {
                 Console.WriteLine("Failed to connect to database! Error: " + e.Message);
                 return CRAWLFAIL;
             }
-            // Connect to the web server to detect redirects.
-            // (But only actually download the page if we need to.)
-            WebRequest request = WebRequest.Create(URL);
-            int crawlDelay;
-            HtmlDocument htmlDoc = new HtmlDocument();
-            // Variables we will need outside the web request scope.
-            bool isHtml;
-            string page;
-            string title = "";
-            bool alreadyInIndex = false;
-            Random IDgenerator = new Random(queueEntry.rngSeed);
-            byte[] IDraw = new byte[8];
-            Int64 pageID;
-            string SQLsafeURL;
-            string SQLsafeDomain;
             try {
+                // Connect to the web server to detect redirects.
+                // (But only actually download the page if we need to.)
+                WebRequest request = WebRequest.Create(URL);
+                int crawlDelay;
+                HtmlDocument htmlDoc = new HtmlDocument();
+                // Variables we will need outside the web request scope.
+                bool isHtml;
+                string page;
+                string title = "";
+                bool alreadyInIndex = false;
+                Random IDgenerator = new Random(queueEntry.rngSeed);
+                byte[] IDraw = new byte[8];
+                Int64 pageID;
+                string SQLsafeURL;
+                string SQLsafeDomain;
                 using (WebResponse response = request.GetResponse()) {
                     webBase = response.ResponseUri;
                     URL = urlCleaner.Match(webBase.ToString()).Value;
@@ -534,6 +534,11 @@ namespace AskMe_Crawler {
                                 return CRAWLLATER;
                             }
                         }
+                        if (response.Headers[HttpResponseHeader.ContentType] == null) {
+                            dbConn.Close();
+                            Console.WriteLine($"URL: {URL} No content type given by server! Don't know if it's safe to parse!");
+                            return CRAWLFAIL;
+                        }
                         string mimeType = mimeTypeFilter.Match(response.Headers[HttpResponseHeader.ContentType]).Value;
                         if (mimeType == "text/plain") {
                             using (StreamReader reader = new StreamReader(file)) {
@@ -564,112 +569,111 @@ namespace AskMe_Crawler {
                         }
                     }
                 }
+                if (title == "") {
+                    title = Uri.UnescapeDataString(webBase.Segments[webBase.Segments.Length - 1]);
+                }
+
+                title = titleCleaner.Replace(title, "");
+
+                // Consolidate all of the SQL queries into one;
+                string query = "BEGIN TRANSACTION;";
+                string newQuery;
+
+                // Add the page to the table of pages.
+                if (alreadyInIndex) {
+                    query += $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
+                } else {
+                    query += $"INSERT INTO Pages (ID, url, title, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{title.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);";
+                }
+
+                if (isHtml) {
+                    HashSet<string> links = new HashSet<string>();
+                    HtmlNodeCollection linkNodes = htmlDoc.DocumentNode.SelectNodes("//a[@href]");
+                    if (linkNodes != null) {
+                        foreach (var node in htmlDoc.DocumentNode.SelectNodes("//a[@href]")) {
+                            try {
+                                // Make sure the link is well formed.
+                                if (node.Attributes["href"] != null) {
+                                    Uri href = new Uri(webBase, node.Attributes["href"].Value);
+                                    if ((href.Scheme == Uri.UriSchemeHttp || href.Scheme == Uri.UriSchemeHttps) &&
+                                            !config.reject.Contains(href.Host)) {
+                                        string link = urlCleaner.Match(href.AbsoluteUri).Value;
+                                        if (link.Length < 512 && URLFilter.IsMatch(link)) {
+                                            links.Add(link.Replace("'", "''"));
+                                        }
+                                    }
+                                }
+                            } catch (UriFormatException e) { }
+                        }
+                        foreach (string link in links) {
+                            if (queueEntry.crawlDepth > 0) {
+                                IDgenerator.NextBytes(IDraw);
+                                Int64 ID = BitConverter.ToInt64(IDraw, 0);
+                                newQuery = $"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{link}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({ID}, '{link}', 0, '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(crawlDelay))}', {queueEntry.crawlDepth - 1});";
+                                if (query.Length + newQuery.Length > 524288) {
+                                    using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
+                                        cmd.ExecuteNonQuery();
+                                    }
+                                    query = "";
+                                }
+                                query += newQuery;
+                            }
+                        }
+                    }
+                }
+
+                // Seperate the page into words.
+                char[] delimiters = { ' ' };
+                string[] words = cleaner.Replace(page, " ").ToLower().Split(delimiters, StringSplitOptions.RemoveEmptyEntries);
+                // Create the tree of word relations
+                Dictionary<string, HashSet<string>> wordEntries = new Dictionary<string, HashSet<string>>();
+                for (int i = 0; i < words.Length; i++) {
+                    string word = words[i];
+                    if (!wordEntries.ContainsKey(word)) {
+                        wordEntries[word] = new HashSet<string>();
+                    }
+                    if (i > 0) {
+                        wordEntries[word].Add(words[i - 1]);
+                        if (i > 1) {
+                            wordEntries[word].Add(words[i - 2]);
+                        }
+                    }
+                    if (i < words.Length - 1) {
+                        wordEntries[word].Add(words[i + 1]);
+                        if (i < words.Length - 2) {
+                            wordEntries[word].Add(words[i + 2]);
+                        }
+                    }
+                }
+                // Serialize neighbors lists to JSON
+                foreach (KeyValuePair<string, HashSet<string>> wordEntry in wordEntries) {
+                    string word = wordEntry.Key;
+                    if (word.Length < 64) {
+                        IDgenerator.NextBytes(IDraw);
+                        Int64 ID = BitConverter.ToInt64(IDraw, 0);
+                        string neighbors = JsonConvert.SerializeObject(wordEntry.Value);
+                        newQuery = $"INSERT INTO PageIndex (ID, word, neighbors, pageID, domain) VALUES ({ID}, '{word.Replace("'", "''")}', '{neighbors.Replace("'", "''")}', {pageID}, '{SQLsafeDomain}');";
+                        if (query.Length + newQuery.Length > 524288) {
+                            using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
+                                cmd.ExecuteNonQuery();
+                            }
+                            query = "";
+                        }
+                        query += newQuery;
+                    }
+                }
+                // Execute the final query.
+                query += "COMMIT;";
+                using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
+                    cmd.ExecuteNonQuery();
+                }
+                dbConn.Close();
+                return CRAWLSUCCESS;
             } catch (Exception e) {
-                Console.WriteLine("Failed to download page " + URL + " !");
+                Console.WriteLine($"Failed to download page {URL}! Error: {e.Message}");
                 dbConn.Close();
                 return CRAWLFAIL;
             }
-
-            if (title == "") {
-                title = Uri.UnescapeDataString(webBase.Segments[webBase.Segments.Length - 1]);
-            }
-
-            title = titleCleaner.Replace(title, "");
-
-            // Consolidate all of the SQL queries into one;
-            string query = "BEGIN TRANSACTION;";
-            string newQuery;
-
-            // Add the page to the table of pages.
-            if (alreadyInIndex) {
-                query += $"UPDATE Pages SET lastIndexed = '{new SqlDateTime(DateTime.UtcNow)}', contents = '{page.Replace("'", "''")}', title = '{title.Replace("'", "''")}', crawlDepth = {queueEntry.crawlDepth} WHERE ID = {pageID}; DELETE FROM PageIndex WHERE pageID = {pageID}";
-            } else {
-                query += $"INSERT INTO Pages (ID, url, title, lastIndexed, nextIndex, contents, crawlDepth, clicks) VALUES ({pageID}, '{SQLsafeURL}', '{title.Replace("'", "''")}', '{new SqlDateTime(DateTime.UtcNow)}', '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(432000 + IDgenerator.Next(0, 172800)))}', '{page.Replace("'", "''")}', {queueEntry.crawlDepth}, 0);";
-            }
-
-            if (isHtml) {
-                HashSet<string> links = new HashSet<string>();
-                HtmlNodeCollection linkNodes = htmlDoc.DocumentNode.SelectNodes("//a[@href]");
-                if (linkNodes != null) {
-                    foreach (var node in htmlDoc.DocumentNode.SelectNodes("//a[@href]")) {
-                        try {
-                            // Make sure the link is well formed.
-                            if (node.Attributes["href"] != null) {
-                                Uri href = new Uri(webBase, node.Attributes["href"].Value);
-                                if ((href.Scheme == Uri.UriSchemeHttp || href.Scheme == Uri.UriSchemeHttps) &&
-                                        !config.reject.Contains(href.Host)) {
-                                    string link = urlCleaner.Match(href.AbsoluteUri).Value;
-                                    if (link.Length < 512 && URLFilter.IsMatch(link)) {
-                                        links.Add(link.Replace("'", "''"));
-                                    }
-                                }
-                            }
-                        } catch (UriFormatException e) { }
-                    }
-                    foreach (string link in links) {
-                        if (queueEntry.crawlDepth > 0) {
-                            IDgenerator.NextBytes(IDraw);
-                            Int64 ID = BitConverter.ToInt64(IDraw, 0);
-                            newQuery = $"IF NOT EXISTS (SELECT * FROM Queue WHERE url = '{link}') INSERT INTO Queue (ID, url, attempts, nextIndex, crawlDepth) VALUES ({ID}, '{link}', 0, '{new SqlDateTime(DateTime.UtcNow + TimeSpan.FromSeconds(crawlDelay))}', {queueEntry.crawlDepth - 1});";
-                            if (query.Length + newQuery.Length > 524288) {
-                                using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
-                                    cmd.ExecuteNonQuery();
-                                }
-                                query = "";
-                            }
-                            query += newQuery;
-                        }
-                    }
-                }
-            }
-
-            // Seperate the page into words.
-            char[] delimiters = { ' ' };
-            string[] words = cleaner.Replace(page, " ").ToLower().Split(delimiters, StringSplitOptions.RemoveEmptyEntries);
-            // Create the tree of word relations
-            Dictionary<string, HashSet<string>> wordEntries = new Dictionary<string, HashSet<string>>();
-            for (int i = 0; i < words.Length; i++) {
-                string word = words[i];
-                if (!wordEntries.ContainsKey(word)) {
-                    wordEntries[word] = new HashSet<string>();
-                }
-                if (i > 0) {
-                    wordEntries[word].Add(words[i - 1]);
-                    if (i > 1) {
-                        wordEntries[word].Add(words[i - 2]);
-                    }
-                }
-                if (i < words.Length - 1) {
-                    wordEntries[word].Add(words[i + 1]);
-                    if (i < words.Length - 2) {
-                        wordEntries[word].Add(words[i + 2]);
-                    }
-                }
-            }
-            // Serialize neighbors lists to JSON
-            foreach (KeyValuePair<string, HashSet<string>> wordEntry in wordEntries) {
-                string word = wordEntry.Key;
-                if (word.Length < 64) {
-                    IDgenerator.NextBytes(IDraw);
-                    Int64 ID = BitConverter.ToInt64(IDraw, 0);
-                    string neighbors = JsonConvert.SerializeObject(wordEntry.Value);
-                    newQuery = $"INSERT INTO PageIndex (ID, word, neighbors, pageID, domain) VALUES ({ID}, '{word.Replace("'", "''")}', '{neighbors.Replace("'", "''")}', {pageID}, '{SQLsafeDomain}');";
-                    if (query.Length + newQuery.Length > 524288) {
-                        using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
-                            cmd.ExecuteNonQuery();
-                        }
-                        query = "";
-                    }
-                    query += newQuery;
-                }
-            }
-            // Execute the final query.
-            query += "COMMIT;";
-            using (SqlCommand cmd = new SqlCommand(query, dbConn)) {
-                cmd.ExecuteNonQuery();
-            }
-            dbConn.Close();
-            return CRAWLSUCCESS;
         }
     }
     public struct AskMeConfig {
